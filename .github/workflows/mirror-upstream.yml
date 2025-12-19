@@ -45,9 +45,11 @@ jobs:
           git remote add upstream https://github.com/libsdl-org/SDL_image.git
           git fetch upstream main --tags
 
-          TARGET_COMMIT="${{ github.event.inputs.upstream_commit_sha || github.event.client_payload.upstream_commit_sha }}"
+          TARGET_COMMIT="${{ github.event.inputs.upstream_commit_sha || github.event.client_payload.upstream_commit_sha }}"          
           echo "Target upstream commit: $TARGET_COMMIT"
-
+          
+          echo "TARGET_COMMIT=$TARGET_COMMIT" >> $GITHUB_ENV
+          
           git reset --hard "$TARGET_COMMIT"
 
       # ------------------------------------------------------------
@@ -103,4 +105,5 @@ jobs:
               "commit_sha": "${{ steps.commit.outputs.fork_commit_sha }}",
               "version": "${{ github.event.inputs.version || github.event.client_payload.version }}",
               "upstream_commit_sha": "${{ github.event.inputs.upstream_commit_sha || github.event.client_payload.upstream_commit_sha }}"
+
             }
