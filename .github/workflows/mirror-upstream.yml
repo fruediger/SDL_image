@@ -1,0 +1,109 @@
+name: Mirror upstream
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_commit_sha:
+        description: "Upstream commit SHA to mirror"
+        required: true
+      version:
+        description: "Version number for release (optional)"
+        required: false
+      trigger_build:
+        description: "Trigger build-release after mirroring"
+        type: boolean
+        default: false
+
+  repository_dispatch:
+    types: [mirror-upstream]
+
+jobs:
+  mirror_upstream:
+    name: Mirror upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------------
+      # Step 1: Checkout fork's main branch
+      # ------------------------------------------------------------
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # Step 2: Add upstream remote and fetch the specified commit
+      # ------------------------------------------------------------
+      - name: Add upstream and fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/libsdl-org/SDL_image.git
+          git fetch upstream main --tags
+
+          TARGET_COMMIT="${{ github.event.inputs.upstream_commit_sha || github.event.client_payload.upstream_commit_sha }}"          
+          echo "Target upstream commit: $TARGET_COMMIT"
+          
+          echo "TARGET_COMMIT=$TARGET_COMMIT" >> $GITHUB_ENV
+          
+          git reset --hard "$TARGET_COMMIT"
+
+      # ------------------------------------------------------------
+      # Step 3: Remove upstream workflows (we use our own CI)
+      # ------------------------------------------------------------
+      - name: Remove upstream workflows
+        run: rm -rf .github/workflows
+
+      # ------------------------------------------------------------
+      # Step 4: Inject custom workflows and .gitattributes
+      # ------------------------------------------------------------
+      - name: Inject custom workflows
+        run: |
+          set -euo pipefail
+          git fetch origin workflow-customizations
+          # Some repos might not have a .gitattributes - keep this defensive
+          git checkout origin/workflow-customizations -- .github .gitattributes 2>/dev/null || true
+          git checkout origin/workflow-customizations -- .github
+
+      # ------------------------------------------------------------
+      # Step 5: Commit and push changes to fork's main
+      # ------------------------------------------------------------
+      - name: Commit and push
+        id: commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "fork_commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git commit -m "Mirror upstream at $TARGET_COMMIT and inject CI"
+          git push --force origin HEAD:main
+
+          echo "fork_commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # Step 6: Optionally trigger build-release workflow
+      # ------------------------------------------------------------
+      - name: Trigger build-release
+        if: github.event.inputs.trigger_build == 'true' || github.event.client_payload.trigger_build == true
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.WORKFLOW_TRIGGER_PAT }}
+          repository: ${{ github.repository }}
+          event-type: build-release
+          client-payload: |
+            {
+              "commit_sha": "${{ steps.commit.outputs.fork_commit_sha }}",
+              "version": "${{ github.event.inputs.version || github.event.client_payload.version }}",
+              "upstream_commit_sha": "${{ github.event.inputs.upstream_commit_sha || github.event.client_payload.upstream_commit_sha }}"
+
+            }
