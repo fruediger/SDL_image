@@ -1,0 +1,736 @@
+name: Build release
+
+permissions:
+  contents: write
+  actions: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Commit SHA to build (optional). If empty, builds the current main."
+        required: false
+      version:
+        description: "Version number for release (optional). If empty, a timestamp will be used."
+        required: false
+      upstream_commit_sha:
+        description: "Upstream commit SHA used as base for the build (optional). If empty, defaults to 'unknown'."
+        required: false
+
+      # Optional override: force a specific SDL version (vX.Y.Z) from the native-SDL mirror
+      native_sdl_tag:
+        description: "Native SDL tag to use for the dependency (optional, e.g. v3.2.28). If empty, an appropriate version is selected automatically."
+        required: false
+
+      # Optional override: force a specific upstream SDL commit SHA as fallback
+      sdl_upstream_commit:
+        description: "Upstream SDL commit SHA fallback (optional). If empty, parsed from native SDL release notes."
+        required: false
+
+  repository_dispatch:
+    types: [build-release]
+
+env:
+  # --------------------------------------------------------------
+  # Configuration: Native SDL mirror repo (owner/name)
+  # You can change these later if you move/rename the repo.
+  # --------------------------------------------------------------
+  NATIVE_SDL_OWNER: fruediger
+  NATIVE_SDL_REPO: SDL-native
+
+jobs:
+  # ===================================================================
+  # 1. Decide versions (SDL_image version + SDL dependency version)
+  # ===================================================================
+  decide_versions:
+    name: Decide versions
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.out.outputs.version }}
+      basedon: ${{ steps.out.outputs.basedon }}
+      sdl_required: ${{ steps.out.outputs.sdl_required }}
+      native_sdl_tag: ${{ steps.out.outputs.native_sdl_tag }}
+      sdl_upstream_commit: ${{ steps.out.outputs.sdl_upstream_commit }}
+    steps:
+      # --------------------------------------------------------------
+      # Step 1: Checkout SDL_image (for reading SDL_REQUIRED_VERSION)
+      # --------------------------------------------------------------
+      - name: Checkout SDL_image
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha || 'main' }}
+          fetch-depth: 0
+
+      # --------------------------------------------------------------
+      # Step 2: Decide release version and SDL dependency version
+      # --------------------------------------------------------------
+      - name: Decide versions
+        id: out
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $nativeSdlOwner = "${{ env.NATIVE_SDL_OWNER }}"
+          $nativeSdlRepo  = "${{ env.NATIVE_SDL_REPO }}"
+          $nativeSdlFull  = "$nativeSdlOwner/$nativeSdlRepo"
+
+          # Version comes from workflow inputs or repository_dispatch payload; fallback to timestamp
+          $inputVersion = "${{ github.event.inputs.version || github.event.client_payload.version }}"
+          if ([string]::IsNullOrWhiteSpace($inputVersion)) {
+            $version = (Get-Date -Format "yyyyMMdd-HHmmss")
+          } else {
+            $version = $inputVersion.Trim()
+          }
+
+          # Based-on line: produce either the URL or 'unknown'
+          $upstreamCommitSha = "${{ github.event.inputs.upstream_commit_sha || github.event.client_payload.upstream_commit_sha }}"
+          if ([string]::IsNullOrWhiteSpace($upstreamCommitSha)) {
+            $basedon = "unknown"
+          } else {
+            $basedon = "https://github.com/libsdl-org/SDL_image/commit/$upstreamCommitSha"
+          }
+
+          # Extract SDL_REQUIRED_VERSION from SDL_image CMakeLists
+          $cmake = Get-Content -Raw -Path "CMakeLists.txt"
+          $m = [regex]::Match($cmake, 'set\s*\(\s*SDL_REQUIRED_VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)\s*\)')
+          if (-not $m.Success) { throw "Could not find SDL_REQUIRED_VERSION in SDL_image CMakeLists.txt" }
+          $sdlRequired = $m.Groups[1].Value
+          Write-Host "SDL required minimum version: $sdlRequired"
+
+          # Allow overriding the native SDL tag (vX.Y.Z)
+          $forcedNativeSdlTag = "${{ github.event.inputs.native_sdl_tag }}"
+          if (-not [string]::IsNullOrWhiteSpace($forcedNativeSdlTag)) {
+            $nativeSdlTag = $forcedNativeSdlTag.Trim()
+            Write-Host "Using forced native SDL tag: $nativeSdlTag"
+          } else {
+            # Policy: pick HIGHEST patch within required major.minor (feature-rich but bounded).
+            $reqObj = [version]$sdlRequired
+            $reqMajorMinor = "$($reqObj.Major).$($reqObj.Minor)"
+
+            $releases = gh api "repos/$nativeSdlFull/releases?per_page=100" | ConvertFrom-Json
+            if (-not $releases) { throw "No releases returned from $nativeSdlFull" }
+
+            $candidates = @()
+            foreach ($r in $releases) {
+              $tag = "$($r.tag_name)"   # e.g. v3.2.28
+              if (-not $tag.StartsWith("v")) { continue }
+              $ver = $tag.Substring(1)
+              if (-not ($ver -match '^\d+\.\d+\.\d+$')) { continue }
+
+              $vObj = [version]$ver
+              $majMin = "$($vObj.Major).$($vObj.Minor)"
+              if ($majMin -ne $reqMajorMinor) { continue }
+              if ($vObj -lt $reqObj) { continue }
+
+              $candidates += [pscustomobject]@{
+                Tag = $tag
+                Version = $ver
+                PublishedAt = $r.published_at
+                Body = $r.body
+              }
+            }
+
+            if ($candidates.Count -eq 0) {
+              throw "No suitable native SDL release found in $nativeSdlFull. Required >= $sdlRequired and major.minor == $reqMajorMinor."
+            }
+
+            $chosen = $candidates | Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
+            $nativeSdlTag = $chosen.Tag
+
+            Write-Host "Chosen native SDL tag: $nativeSdlTag (from $nativeSdlFull)"
+          }
+
+          # Parse upstream SDL commit SHA from the native SDL release body
+          # Expected line: "Based on: https://github.com/libsdl-org/SDL/commit/<sha>"
+          $forcedUpstreamCommit = "${{ github.event.inputs.sdl_upstream_commit }}"
+          if (-not [string]::IsNullOrWhiteSpace($forcedUpstreamCommit)) {
+            $sdlUpstreamCommit = $forcedUpstreamCommit.Trim()
+            Write-Host "Using forced upstream SDL commit SHA: $sdlUpstreamCommit"
+          } else {
+            $release = gh api "repos/$nativeSdlFull/releases/tags/$nativeSdlTag" | ConvertFrom-Json
+            $body = "$($release.body)"
+            $m2 = [regex]::Match($body, 'Based on:\s*https://github\.com/libsdl-org/SDL/commit/([0-9a-f]{7,40})')
+            if (-not $m2.Success) {
+              throw "Could not parse upstream SDL commit SHA from native SDL release notes for $nativeSdlTag"
+            }
+            $sdlUpstreamCommit = $m2.Groups[1].Value
+            Write-Host "Upstream SDL commit SHA (from release notes): $sdlUpstreamCommit"
+          }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "basedon=$basedon"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sdl_required=$sdlRequired"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "native_sdl_tag=$nativeSdlTag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sdl_upstream_commit=$sdlUpstreamCommit"
+
+  # ===================================================================
+  # 2. Build (Linux) - builds SDL then SDL_image
+  # ===================================================================
+  build_linux:
+    name: Build ${{ matrix.rid }} (Linux)
+    runs-on: ubuntu-latest
+    needs: [decide_versions]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ----------------------------------------------------------
+          # Native amd64 build — no cross-arch setup needed
+          # ----------------------------------------------------------
+          - rid: linux-x64
+            cc: gcc-14
+            cxx: g++-14
+            apt_arch: ""
+            arch_pkgs: ""
+            arch_setup: ""
+            cmake_args: "-DCMAKE_C_FLAGS=-m64 -DCMAKE_CXX_FLAGS=-m64"
+
+          # ----------------------------------------------------------
+          # 32-bit x86 build — runs on amd64 host with -m32
+          # Needs multilib toolchain and 32-bit libs to link successfully.
+          # ----------------------------------------------------------
+          - rid: linux-x86
+            cc: gcc-14
+            cxx: g++-14
+            apt_arch: "i386"
+            arch_pkgs: "libc6-dev-i386 linux-libc-dev:i386 libstdc++-14-dev:i386 gcc-14-multilib g++-14-multilib"
+            arch_setup: |
+              sudo dpkg --add-architecture i386
+              sudo apt-get update
+            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32"
+
+          # ----------------------------------------------------------
+          # ARM64 cross-build
+          # ----------------------------------------------------------
+          - rid: linux-arm64
+            cc: aarch64-linux-gnu-gcc-14
+            cxx: aarch64-linux-gnu-g++-14
+            apt_arch: "arm64"
+            arch_pkgs: "libc6-dev-arm64-cross linux-libc-dev-arm64-cross"
+            arch_setup: |
+              sudo dpkg --add-architecture arm64
+              if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+                sudo mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled
+              fi
+              sudo tee /etc/apt/sources.list >/dev/null <<'EOF'
+              deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
+              deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
+              deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-backports main restricted universe multiverse
+              deb [arch=amd64] http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+              EOF
+              sudo tee /etc/apt/sources.list.d/arm64.list >/dev/null <<'EOF'
+              deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
+              deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
+              deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-backports main restricted universe multiverse
+              deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
+              EOF
+              sudo apt-get update
+            cmake_args: "-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64"
+
+          # ----------------------------------------------------------
+          # ARM32 (armhf) cross-build
+          # ----------------------------------------------------------
+          - rid: linux-arm
+            cc: arm-linux-gnueabihf-gcc-14
+            cxx: arm-linux-gnueabihf-g++-14
+            apt_arch: "armhf"
+            arch_pkgs: "libc6-dev-armhf-cross linux-libc-dev-armhf-cross"
+            arch_setup: |
+              sudo dpkg --add-architecture armhf
+              if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+                sudo mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled
+              fi
+              sudo tee /etc/apt/sources.list >/dev/null <<'EOF'
+              deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
+              deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
+              deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-backports main restricted universe multiverse
+              deb [arch=amd64] http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+              EOF
+              sudo tee /etc/apt/sources.list.d/armhf.list >/dev/null <<'EOF'
+              deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
+              deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
+              deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports noble-backports main restricted universe multiverse
+              deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
+              EOF
+              sudo apt-get update
+            cmake_args: "-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm -DCMAKE_C_FLAGS=-marm -DCMAKE_CXX_FLAGS=-marm"
+
+    env:
+      BUILD_TYPE: Release
+      PREFIX_DIR: ${{ github.workspace }}/_prefix
+      PACKAGE_DIR: ${{ github.workspace }}/package
+      SUCCESS_DIR: ${{ github.workspace }}/success
+
+    steps:
+      # --------------------------------------------------------------
+      # Step 1: Checkout SDL_image (with submodules)
+      # --------------------------------------------------------------
+      - name: Checkout SDL_image
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha || 'main' }}
+          fetch-depth: 0
+          submodules: recursive
+
+      # --------------------------------------------------------------
+      # Step 2: Install specific CMake version
+      # --------------------------------------------------------------
+      - name: Install CMake 3.30.0
+        uses: jwlawson/actions-setup-cmake@v1
+        with:
+          cmake-version: '3.30.0'
+
+      # --------------------------------------------------------------
+      # Step 3: Setup architecture
+      # --------------------------------------------------------------
+      - name: Setup architecture
+        run: ${{ matrix.arch_setup }}
+        shell: bash
+
+      # --------------------------------------------------------------
+      # Step 4: Install build dependencies
+      # --------------------------------------------------------------
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git make pkg-config ninja-build \
+            gcc-14 g++-14 \
+            gcc-14-aarch64-linux-gnu g++-14-aarch64-linux-gnu \
+            gcc-14-arm-linux-gnueabihf g++-14-arm-linux-gnueabihf
+
+          if [ -n "${{ matrix.arch_pkgs }}" ]; then
+            sudo apt-get install -y ${{ matrix.arch_pkgs }}
+          fi
+
+      # --------------------------------------------------------------
+      # Step 5: Ensure external/ sources exist (fallback download.sh)
+      # --------------------------------------------------------------
+      - name: Ensure external sources exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "external/zlib/CMakeLists.txt" ]; then
+            echo "external/ not populated; running external/download.sh"
+            chmod +x external/download.sh
+            ./external/download.sh --depth 1
+          else
+            echo "external/ sources present."
+          fi
+
+      # --------------------------------------------------------------
+      # Step 6: Checkout SDL source (prefer native SDL mirror tag; fallback to upstream commit)
+      # --------------------------------------------------------------
+      - name: Checkout SDL source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NATIVE_SDL_FULL="${NATIVE_SDL_OWNER}/${NATIVE_SDL_REPO}"
+          SDL_TAG="${{ needs.decide_versions.outputs.native_sdl_tag }}"
+          SDL_UPSTREAM_COMMIT="${{ needs.decide_versions.outputs.sdl_upstream_commit }}"
+
+          echo "Attempting SDL checkout from native SDL mirror ($NATIVE_SDL_FULL) tag $SDL_TAG"
+          mkdir -p _deps && cd _deps
+
+          if git clone --filter=blob:none "https://github.com/$NATIVE_SDL_FULL.git" SDL; then
+            cd SDL
+            git fetch --tags --force
+            if git rev-parse "$SDL_TAG" >/dev/null 2>&1; then
+              git checkout "$SDL_TAG"
+              echo "Checked out SDL from native SDL mirror tag $SDL_TAG"
+              exit 0
+            fi
+          fi
+
+          echo "Falling back to upstream SDL commit $SDL_UPSTREAM_COMMIT"
+          rm -rf SDL
+          git clone --filter=blob:none https://github.com/libsdl-org/SDL.git SDL
+          cd SDL
+          git fetch --force origin "$SDL_UPSTREAM_COMMIT"
+          git checkout "$SDL_UPSTREAM_COMMIT"
+
+      # --------------------------------------------------------------
+      # Step 7: Build & install SDL (shared)
+      # --------------------------------------------------------------
+      - name: Build & install SDL (shared)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S _deps/SDL -B _deps/SDL-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            ${{ matrix.cmake_args }} \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_DOCS=FALSE \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX_DIR/sdl"
+
+          cmake --build _deps/SDL-build --config $BUILD_TYPE
+          cmake --install _deps/SDL-build
+
+      # --------------------------------------------------------------
+      # Step 8: Configure SDL_image (vendored deps, static link)
+      # --------------------------------------------------------------
+      - name: Configure SDL_image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            ${{ matrix.cmake_args }} \
+            -DCMAKE_PREFIX_PATH="$PREFIX_DIR/sdl" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DSDLIMAGE_VENDORED=ON \
+            -DSDLIMAGE_DEPS_SHARED=OFF \
+            -DSDLIMAGE_STRICT=ON \
+            -DSDLIMAGE_BACKEND_STB=OFF \
+            -DSDLIMAGE_BACKEND_WIC=OFF \
+            -DSDLIMAGE_JXL=ON \
+            -DSDLIMAGE_SAMPLES=OFF \
+            -DSDLIMAGE_TESTS=OFF
+
+      # --------------------------------------------------------------
+      # Step 9: Build SDL_image
+      # --------------------------------------------------------------
+      - name: Build SDL_image
+        shell: bash
+        run: cmake --build build --config $BUILD_TYPE
+
+      # --------------------------------------------------------------
+      # Step 10: Copy built library to package dir and mark success
+      # --------------------------------------------------------------
+      - name: Copy library and mark success
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PACKAGE_DIR/runtimes/${{ matrix.rid }}/native"
+
+          libfile=$(find build -type f -name "libSDL3_image.so.*" | sort -V | tail -n 1 || true)
+          if [ -z "$libfile" ]; then
+            libfile=$(find build -type f -name "libSDL3_image.so" | head -n 1 || true)
+          fi
+          if [ -z "$libfile" ]; then
+            echo "WARNING: libSDL3_image.so not found for RID ${{ matrix.rid }}. Skipping."
+            exit 0
+          fi
+
+          cp "$libfile" "$PACKAGE_DIR/runtimes/${{ matrix.rid }}/native/libSDL3_image.so"
+          mkdir -p "$SUCCESS_DIR"
+          echo "${{ matrix.rid }}" > "$SUCCESS_DIR/${{ matrix.rid }}.txt"
+
+      # --------------------------------------------------------------
+      # Step 11: Upload built binary as artifact
+      # --------------------------------------------------------------
+      - name: Upload artifact (binary)
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}
+          path: package/runtimes/${{ matrix.rid }}
+          if-no-files-found: ignore
+
+      # --------------------------------------------------------------
+      # Step 12: Upload success marker as artifact
+      # --------------------------------------------------------------
+      - name: Upload artifact (success marker)
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: success-${{ matrix.rid }}
+          path: success/${{ matrix.rid }}.txt
+          if-no-files-found: ignore
+
+  # ===================================================================
+  # 3. Build (Windows) - builds SDL then SDL_image
+  # ===================================================================
+  build_windows:
+    name: Build ${{ matrix.rid }} (Windows)
+    runs-on: windows-latest
+    needs: [decide_versions]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ----------------------------------------------------------
+          # Native x64 build
+          # ----------------------------------------------------------
+          - rid: win-x64
+            arch: x64
+            generator: "Visual Studio 17 2022"
+
+          # ----------------------------------------------------------
+          # Native x86 build
+          # ----------------------------------------------------------
+          - rid: win-x86
+            arch: Win32
+            generator: "Visual Studio 17 2022"
+
+          # ----------------------------------------------------------
+          # ARM64 build
+          # ----------------------------------------------------------
+          - rid: win-arm64
+            arch: ARM64
+            generator: "Visual Studio 17 2022"
+
+    env:
+      BUILD_TYPE: Release
+      PREFIX_DIR: ${{ github.workspace }}\_prefix
+      PACKAGE_DIR: ${{ github.workspace }}\package
+      SUCCESS_DIR: ${{ github.workspace }}\success
+
+    steps:
+      # --------------------------------------------------------------
+      # Step 1: Checkout SDL_image (with submodules)
+      # --------------------------------------------------------------
+      - name: Checkout SDL_image
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha || 'main' }}
+          fetch-depth: 0
+          submodules: recursive
+
+      # --------------------------------------------------------------
+      # Step 2: Ensure external/ sources exist (fallback Get-GitModules.ps1)
+      # --------------------------------------------------------------
+      - name: Ensure external sources exist
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "external/zlib/CMakeLists.txt")) {
+            Write-Host "external/ not populated; running external/Get-GitModules.ps1"
+            .\external\Get-GitModules.ps1 --depth 1
+          } else {
+            Write-Host "external/ sources present."
+          }
+
+      # --------------------------------------------------------------
+      # Step 3: Install specific CMake version (if needed)
+      # --------------------------------------------------------------
+      - name: Install CMake 3.30.0
+        uses: jwlawson/actions-setup-cmake@v1
+        with:
+          cmake-version: '3.30.0'
+
+      # --------------------------------------------------------------
+      # Step 4: Checkout SDL source (prefer native SDL mirror tag; fallback to upstream commit)
+      # --------------------------------------------------------------
+      - name: Checkout SDL source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $nativeSdlOwner = "${{ env.NATIVE_SDL_OWNER }}"
+          $nativeSdlRepo  = "${{ env.NATIVE_SDL_REPO }}"
+          $nativeSdlFull  = "$nativeSdlOwner/$nativeSdlRepo"
+
+          $sdlTag = "${{ needs.decide_versions.outputs.native_sdl_tag }}"
+          $sdlUpstreamCommit = "${{ needs.decide_versions.outputs.sdl_upstream_commit }}"
+
+          New-Item -ItemType Directory -Force -Path "_deps" | Out-Null
+          Push-Location "_deps"
+
+          Write-Host "Attempting SDL checkout from native SDL mirror ($nativeSdlFull) tag $sdlTag"
+          git clone --filter=blob:none "https://github.com/$nativeSdlFull.git" SDL
+          Push-Location "SDL"
+          git fetch --tags --force
+
+          $canCheckoutTag = $true
+          try { git rev-parse $sdlTag | Out-Null } catch { $canCheckoutTag = $false }
+
+          if ($canCheckoutTag) {
+            git checkout $sdlTag
+            Write-Host "Checked out SDL from native SDL mirror tag $sdlTag"
+            Pop-Location; Pop-Location
+            exit 0
+          }
+
+          Write-Host "Falling back to upstream SDL commit $sdlUpstreamCommit"
+          Pop-Location
+          Remove-Item -Recurse -Force "SDL"
+
+          git clone --filter=blob:none https://github.com/libsdl-org/SDL.git SDL
+          Push-Location "SDL"
+          git fetch --force origin $sdlUpstreamCommit
+          git checkout $sdlUpstreamCommit
+
+          Pop-Location; Pop-Location
+
+      # --------------------------------------------------------------
+      # Step 5: Configure SDL (shared)
+      # --------------------------------------------------------------
+      - name: Configure SDL (shared)
+        shell: pwsh
+        run: |
+          cmake -S _deps/SDL -B _deps/SDL-build -G "${{ matrix.generator }}" -A ${{ matrix.arch }} `
+            -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE `
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF `
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_DOCS=FALSE `
+            -DCMAKE_INSTALL_PREFIX="$env:PREFIX_DIR\sdl"
+
+      # --------------------------------------------------------------
+      # Step 6: Build & install SDL
+      # --------------------------------------------------------------
+      - name: Build & install SDL
+        shell: pwsh
+        run: |
+          cmake --build _deps/SDL-build --config $env:BUILD_TYPE
+          cmake --install _deps/SDL-build --config $env:BUILD_TYPE
+
+      # --------------------------------------------------------------
+      # Step 7: Configure SDL_image (vendored deps, static link)
+      # --------------------------------------------------------------
+      - name: Configure SDL_image
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "${{ matrix.generator }}" -A ${{ matrix.arch }} `
+            -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE `
+            -DCMAKE_PREFIX_PATH="$env:PREFIX_DIR\sdl" `
+            -DBUILD_SHARED_LIBS=ON `
+            -DSDLIMAGE_VENDORED=ON `
+            -DSDLIMAGE_DEPS_SHARED=OFF `
+            -DSDLIMAGE_STRICT=ON `
+            -DSDLIMAGE_BACKEND_STB=OFF `
+            -DSDLIMAGE_BACKEND_WIC=OFF `
+            -DSDLIMAGE_JXL=ON `
+            -DSDLIMAGE_SAMPLES=OFF `
+            -DSDLIMAGE_TESTS=OFF
+
+      # --------------------------------------------------------------
+      # Step 8: Build SDL_image
+      # --------------------------------------------------------------
+      - name: Build SDL_image
+        shell: pwsh
+        run: cmake --build build --config $env:BUILD_TYPE
+
+      # --------------------------------------------------------------
+      # Step 9: Copy built DLL to package dir and mark success
+      # --------------------------------------------------------------
+      - name: Copy library and mark success
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:PACKAGE_DIR\runtimes\${{ matrix.rid }}\native" | Out-Null
+          $dllFile = Get-ChildItem -Path build -Recurse -Filter "SDL3_image.dll" | Select-Object -First 1
+          if (-not $dllFile) {
+            Write-Warning "SDL3_image.dll not found for RID ${{ matrix.rid }}. Skipping."
+            exit 0
+          }
+          Copy-Item $dllFile.FullName "$env:PACKAGE_DIR\runtimes\${{ matrix.rid }}\native\SDL3_image.dll"
+          New-Item -ItemType Directory -Force -Path "$env:SUCCESS_DIR" | Out-Null
+          "${{ matrix.rid }}" | Out-File -FilePath "$env:SUCCESS_DIR\${{ matrix.rid }}.txt" -Encoding ascii
+
+      # --------------------------------------------------------------
+      # Step 10: Upload built binary as artifact
+      # --------------------------------------------------------------
+      - name: Upload artifact (binary)
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}
+          path: package/runtimes/${{ matrix.rid }}
+          if-no-files-found: ignore
+
+      # --------------------------------------------------------------
+      # Step 11: Upload success marker as artifact
+      # --------------------------------------------------------------
+      - name: Upload artifact (success marker)
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: success-${{ matrix.rid }}
+          path: success/${{ matrix.rid }}.txt
+          if-no-files-found: ignore
+
+  # ===================================================================
+  # 4. Package & Release (Linux + Windows)
+  # ===================================================================
+  package_and_release:
+    name: Package all builds and create release
+    runs-on: windows-latest
+    needs: [decide_versions, build_linux, build_windows]
+    if: always()
+    env:
+      ARTIFACTS_DIR: ${{ github.workspace }}\artifacts
+
+    steps:
+      # --------------------------------------------------------------
+      # Step 1: Download all artifacts from both build jobs
+      # --------------------------------------------------------------
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts_download
+
+      # --------------------------------------------------------------
+      # Step 2: Create combined runtimes folder
+      # --------------------------------------------------------------
+      - name: Create combined runtimes folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "runtimes" | Out-Null
+          Get-ChildItem -Path "artifacts_download" -Directory | ForEach-Object {
+            $rid = $_.Name
+            if (Test-Path "$($_.FullName)\native") {
+              New-Item -ItemType Directory -Force -Path "runtimes\$rid" | Out-Null
+              Copy-Item -Recurse -Force "$($_.FullName)\native" "runtimes\$rid\"
+            }
+          }
+
+      # --------------------------------------------------------------
+      # Step 3: Zip the combined runtimes folder
+      # --------------------------------------------------------------
+      - name: Create combined zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ARTIFACTS_DIR" | Out-Null
+          Compress-Archive -Path "runtimes" -DestinationPath "$env:ARTIFACTS_DIR\runtimes.zip" -Force
+
+      # --------------------------------------------------------------
+      # Step 4: Gather release information
+      # --------------------------------------------------------------
+      - name: Gather release information
+        id: gather
+        shell: pwsh
+        run: |
+          $version = "${{ needs.decide_versions.outputs.version }}"
+          $basedon = "${{ needs.decide_versions.outputs.basedon }}"
+          $sdlReq  = "${{ needs.decide_versions.outputs.sdl_required }}"
+          $sdlTag  = "${{ needs.decide_versions.outputs.native_sdl_tag }}"
+
+          $successFiles = Get-ChildItem -Path "artifacts_download" -Recurse -Filter "*.txt"
+          if ($successFiles.Count -eq 0) {
+            $ridlist = "None"
+          } else {
+            $ridlist = ($successFiles | Get-Content) -join ", "
+          }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "basedon=$basedon"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ridlist=$ridlist"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sdlreq=$sdlReq"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sdltag=$sdlTag"
+
+          if ($ridlist -eq "None") { exit 1 }
+
+      # --------------------------------------------------------------
+      # Step 5: Create or update the GitHub release
+      # --------------------------------------------------------------
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.gather.outputs.version }}
+          name: ${{ steps.gather.outputs.version }}
+          body: |
+            Based on: ${{ steps.gather.outputs.basedon }}
+            SDL used for build: ${{ steps.gather.outputs.sdltag }} (required >= ${{ steps.gather.outputs.sdlreq }})
+            Included runtimes: ${{ steps.gather.outputs.ridlist }}
+          files: |
+            ${{ env.ARTIFACTS_DIR }}/runtimes.zip

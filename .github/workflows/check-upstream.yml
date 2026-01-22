@@ -1,0 +1,116 @@
+name: Check upstream
+
+permissions:
+  contents: read
+  actions: write
+
+on:
+  # Run daily at 06:00 UTC to check for new upstream releases
+  schedule:
+    - cron: '0 6 * * *'
+  # Allow manual triggering for testing or forced checks
+  workflow_dispatch:
+
+jobs:
+  check_upstream:
+    name: Check upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------------
+      # Step 1: Fetch latest release from upstream (libsdl-org/SDL_image)
+      # ------------------------------------------------------------
+      - name: Get latest upstream release
+        id: upstream        
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          upstream_repo="libsdl-org/SDL_image"
+
+          # Query GitHub API for latest release metadata
+          latest_release=$(gh api repos/$upstream_repo/releases/latest)
+
+          # Extract tag name
+          tag_name=$(echo "$latest_release" | jq -r '.tag_name')
+          
+          # Get object infos about from the tag reference
+          tag_ref=$(gh api repos/$upstream_repo/git/ref/tags/$tag_name)
+          object_sha=$(echo "$tag_ref" | jq -r '.object.sha')
+          object_type=$(echo "$tag_ref" | jq -r '.object.type')
+
+          if [ "$object_type" = "commit" ]; then
+            # The object is of type commit -> it's SHA is the commit SHA
+            upstream_commit_sha="$object_sha"
+          else
+            # The object seems to be of type tag -> get commit SHA otherwise
+            tag=$(gh api repos/$upstream_repo/git/tags/$object_sha)
+            upstream_commit_sha=$(echo "$tag" | jq -r '.object.sha')
+          fi
+
+          echo "Latest upstream tag: $tag_name"
+          echo "Upstream commit SHA: $upstream_commit_sha"
+
+          # SDL_image uses tags like "release-3.x.y" - only process those
+          if [[ ! "$tag_name" =~ ^release- ]]; then
+            echo "Not a release-* tag. Exiting."
+            exit 0
+          fi
+
+          # Extract version by stripping 'release-' prefix
+          version="${tag_name#release-}"
+
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "upstream_commit_sha=$upstream_commit_sha" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # Step 2: Fetch latest release from our fork
+      # ------------------------------------------------------------
+      - name: Get latest fork release
+        id: fork        
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest_release=$(gh api repos/${{ github.repository }}/releases/latest 2>/dev/null || echo "")
+
+          # Do we even have at least one release?
+          if [ -z "$latest_release" ]; then
+            echo "No releases found in fork."
+            exit 0
+          fi
+
+          fork_tag=$(echo "$latest_release" | jq -r .tag_name)
+
+          # Strip 'v' prefix from our tag format
+          fork_version="${fork_tag#v}"
+
+          echo "Our latest release: $fork_version"
+          echo "fork_version=$fork_version" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # Step 3: Compare versions to detect new upstream release
+      # ------------------------------------------------------------
+      - name: Compare versions
+        # If fork_version is undefined, fallback to '' so comparison is safe
+        if: steps.upstream.outputs.version != (steps.fork.outputs.fork_version || '')
+        run: |
+          echo "New upstream release detected: ${{ steps.upstream.outputs.version }}"
+          echo "Triggering mirror-upstream workflow..."
+
+      # ------------------------------------------------------------
+      # Step 4: Trigger mirror-upstream if new release found
+      # ------------------------------------------------------------
+      - name: Trigger mirror-upstream
+        if: steps.upstream.outputs.version != steps.fork.outputs.fork_version
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.WORKFLOW_TRIGGER_PAT }}
+          repository: ${{ github.repository }}
+          event-type: mirror-upstream
+          client-payload: |
+            {
+              "upstream_commit_sha": "${{ steps.upstream.outputs.upstream_commit_sha }}",
+              "version": "${{ steps.upstream.outputs.version }}",
+              "trigger_build": true
+            }
