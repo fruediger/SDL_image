@@ -450,7 +450,7 @@ jobs:
             -DSDLIMAGE_BACKEND_STB=OFF \
             -DSDLIMAGE_BACKEND_WIC=OFF \
             -DSDLIMAGE_PNG_LIBPNG=ON \
-            -DSDLIMAGE_AVIF=OFF \
+            -DSDLIMAGE_AVIF=ON \
             -DSDLIMAGE_JPG=ON \
             -DSDLIMAGE_JXL=ON \
             -DSDLIMAGE_PNG=ON \
@@ -663,7 +663,7 @@ jobs:
             -DSDLIMAGE_BACKEND_STB=OFF `
             -DSDLIMAGE_BACKEND_WIC=OFF `
             -DSDLIMAGE_PNG_LIBPNG=ON `
-            -DSDLIMAGE_AVIF=OFF `
+            -DSDLIMAGE_AVIF=ON `
             -DSDLIMAGE_JPG=ON `
             -DSDLIMAGE_JXL=ON `
             -DSDLIMAGE_PNG=ON `
