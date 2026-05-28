@@ -17,9 +17,9 @@ on:
         description: "Upstream commit SHA used as base for the build (optional). If empty, defaults to 'unknown'."
         required: false
 
-      # Optional override: force a specific SDL version (vX.Y.Z) from the native-SDL mirror
+      # Optional override: force a specific SDL version (vX.Y.Z) from the native SDL mirror
       native_sdl_tag:
-        description: "Native SDL tag to use for the dependency (optional, e.g. v3.2.28). If empty, an appropriate version is selected automatically."
+        description: "Native SDL tag to use for the dependency (optional, e.g. v3.4.0). If empty, an appropriate version is selected automatically."
         required: false
 
       # Optional override: force a specific upstream SDL commit SHA as fallback
@@ -33,10 +33,9 @@ on:
 env:
   # --------------------------------------------------------------
   # Configuration: Native SDL mirror repo (owner/name)
-  # You can change these later if you move/rename the repo.
   # --------------------------------------------------------------
-  NATIVE_SDL_OWNER: fruediger
-  NATIVE_SDL_REPO: SDL-native
+  NATIVE_SDL_OWNER: Sdl3Sharp
+  NATIVE_SDL_REPO: SDL
 
 jobs:
   # ===================================================================
@@ -291,26 +290,81 @@ jobs:
         shell: bash
 
       # --------------------------------------------------------------
-      # Step 4: Install build dependencies
+      # Step 4: Hold critical packages to avoid removal during multi-arch installs
+      # --------------------------------------------------------------
+      - name: Hold critical packages to avoid removal
+        run: |
+          sudo apt-mark hold grub-common grub-efi-amd64-bin python3 python3-apt shim-signed
+
+      # --------------------------------------------------------------
+      # Step 5: Install build dependencies
       # --------------------------------------------------------------
       - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
+          ARCH="${{ matrix.apt_arch }}"
+          SUF=""
+          if [ -n "$ARCH" ]; then SUF=":$ARCH"; fi
 
           sudo apt-get update
+
+          # Common host-arch build dependencies for SDL build compatibility
           sudo apt-get install -y \
-            build-essential git make pkg-config ninja-build \
+            build-essential git make pkg-config ninja-build gnome-desktop-testing \
+            libasound2-dev libpulse-dev libaudio-dev libjack-dev libsndio-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev \
+            libgl1-mesa-dev libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev \
+            libudev-dev libpipewire-0.3-dev libwayland-dev libdecor-0-dev \
+            libusb-1.0-0-dev libunwind-dev \
             gcc-14 g++-14 \
             gcc-14-aarch64-linux-gnu g++-14-aarch64-linux-gnu \
-            gcc-14-arm-linux-gnueabihf g++-14-arm-linux-gnueabihf
+            gcc-14-arm-linux-gnueabihf g++-14-arm-linux-gnueabihf \
+            libglib2.0-dev libvulkan-dev \
+            libibus-1.0-dev libibus-1.0-5 \
+            liburing-dev liburing2 \
+            python3
 
           if [ -n "${{ matrix.arch_pkgs }}" ]; then
             sudo apt-get install -y ${{ matrix.arch_pkgs }}
           fi
 
+          # For cross-arch installs, mirror the native SDL workflow behavior
+          if [ -n "$ARCH" ]; then
+            PKGS="\
+              libxml2$SUF \
+              libasound2-dev$SUF libpulse-dev$SUF libaudio-dev$SUF libjack-dev$SUF libsndio-dev$SUF \
+              libx11-dev$SUF libxext-dev$SUF libxrandr-dev$SUF libxcursor-dev$SUF libxfixes-dev$SUF \
+              libxi-dev$SUF libxss-dev$SUF libxtst-dev$SUF libxkbcommon-dev$SUF libdrm-dev$SUF \
+              libgbm-dev$SUF libgl1-mesa-dev$SUF libgles2-mesa-dev$SUF libegl1-mesa-dev$SUF \
+              libdbus-1-dev$SUF libudev-dev$SUF libpipewire-0.3-dev$SUF libwayland-dev$SUF \
+              libdecor-0-dev$SUF libusb-1.0-0-dev$SUF libunwind-dev$SUF \
+              libglib2.0-dev$SUF libvulkan-dev$SUF \
+              libibus-1.0-dev$SUF libibus-1.0-5$SUF"
+
+            if [ "$ARCH" != "i386" ]; then
+              PKGS="$PKGS liburing-dev$SUF liburing2$SUF"
+            fi
+
+            sudo apt-get install -y $PKGS
+          fi
+
+          # Additional libs likely needed by vendored SDL_image deps
+          sudo apt-get install -y \
+            zlib1g-dev \
+            libbz2-dev \
+            liblzma-dev \
+            libbrotli-dev \
+            libpng-dev
+
+          if [ "$ARCH" = "i386" ]; then
+            echo 'int main(void){return 0;}' | gcc-14 -m32 -x c - -o /tmp/t32
+            file /tmp/t32 || true
+          fi
+
       # --------------------------------------------------------------
-      # Step 5: Ensure external/ sources exist (fallback download.sh)
+      # Step 6: Ensure external/ sources exist
       # --------------------------------------------------------------
       - name: Ensure external sources exist
         shell: bash
@@ -319,13 +373,13 @@ jobs:
           if [ ! -f "external/zlib/CMakeLists.txt" ]; then
             echo "external/ not populated; running external/download.sh"
             chmod +x external/download.sh
-            ./external/download.sh --depth 1
+            ./external/download.sh
           else
             echo "external/ sources present."
           fi
 
       # --------------------------------------------------------------
-      # Step 6: Checkout SDL source (prefer native SDL mirror tag; fallback to upstream commit)
+      # Step 7: Checkout SDL source
       # --------------------------------------------------------------
       - name: Checkout SDL source
         shell: bash
@@ -357,7 +411,7 @@ jobs:
           git checkout "$SDL_UPSTREAM_COMMIT"
 
       # --------------------------------------------------------------
-      # Step 7: Build & install SDL (shared)
+      # Step 8: Build & install SDL (shared)
       # --------------------------------------------------------------
       - name: Build & install SDL (shared)
         shell: bash
@@ -376,7 +430,7 @@ jobs:
           cmake --install _deps/SDL-build
 
       # --------------------------------------------------------------
-      # Step 8: Configure SDL_image (vendored deps, static link)
+      # Step 9: Configure SDL_image
       # --------------------------------------------------------------
       - name: Configure SDL_image
         shell: bash
@@ -394,19 +448,26 @@ jobs:
             -DSDLIMAGE_STRICT=ON \
             -DSDLIMAGE_BACKEND_STB=OFF \
             -DSDLIMAGE_BACKEND_WIC=OFF \
+            -DSDLIMAGE_PNG_LIBPNG=ON \
+            -DSDLIMAGE_AVIF=ON \
+            -DSDLIMAGE_JPG=ON \
             -DSDLIMAGE_JXL=ON \
+            -DSDLIMAGE_PNG=ON \
+            -DSDLIMAGE_SVG=ON \
+            -DSDLIMAGE_TIF=ON \
+            -DSDLIMAGE_WEBP=ON \
             -DSDLIMAGE_SAMPLES=OFF \
             -DSDLIMAGE_TESTS=OFF
 
       # --------------------------------------------------------------
-      # Step 9: Build SDL_image
+      # Step 10: Build SDL_image
       # --------------------------------------------------------------
       - name: Build SDL_image
         shell: bash
         run: cmake --build build --config $BUILD_TYPE
 
       # --------------------------------------------------------------
-      # Step 10: Copy built library to package dir and mark success
+      # Step 11: Copy built library to package dir and mark success
       # --------------------------------------------------------------
       - name: Copy library and mark success
         shell: bash
@@ -428,7 +489,7 @@ jobs:
           echo "${{ matrix.rid }}" > "$SUCCESS_DIR/${{ matrix.rid }}.txt"
 
       # --------------------------------------------------------------
-      # Step 11: Upload built binary as artifact
+      # Step 12: Upload built binary as artifact
       # --------------------------------------------------------------
       - name: Upload artifact (binary)
         if: success() || failure()
@@ -439,7 +500,7 @@ jobs:
           if-no-files-found: ignore
 
       # --------------------------------------------------------------
-      # Step 12: Upload success marker as artifact
+      # Step 13: Upload success marker as artifact
       # --------------------------------------------------------------
       - name: Upload artifact (success marker)
         if: success() || failure()
@@ -500,20 +561,20 @@ jobs:
           submodules: recursive
 
       # --------------------------------------------------------------
-      # Step 2: Ensure external/ sources exist (fallback Get-GitModules.ps1)
+      # Step 2: Ensure external/ sources exist
       # --------------------------------------------------------------
       - name: Ensure external sources exist
         shell: pwsh
         run: |
           if (-not (Test-Path "external/zlib/CMakeLists.txt")) {
             Write-Host "external/ not populated; running external/Get-GitModules.ps1"
-            .\external\Get-GitModules.ps1 --depth 1
+            .\external\Get-GitModules.ps1
           } else {
             Write-Host "external/ sources present."
           }
 
       # --------------------------------------------------------------
-      # Step 3: Install specific CMake version (if needed)
+      # Step 3: Install specific CMake version
       # --------------------------------------------------------------
       - name: Install CMake 3.30.0
         uses: jwlawson/actions-setup-cmake@v1
@@ -521,7 +582,7 @@ jobs:
           cmake-version: '3.30.0'
 
       # --------------------------------------------------------------
-      # Step 4: Checkout SDL source (prefer native SDL mirror tag; fallback to upstream commit)
+      # Step 4: Checkout SDL source
       # --------------------------------------------------------------
       - name: Checkout SDL source
         shell: pwsh
@@ -586,7 +647,7 @@ jobs:
           cmake --install _deps/SDL-build --config $env:BUILD_TYPE
 
       # --------------------------------------------------------------
-      # Step 7: Configure SDL_image (vendored deps, static link)
+      # Step 7: Configure SDL_image
       # --------------------------------------------------------------
       - name: Configure SDL_image
         shell: pwsh
@@ -600,7 +661,14 @@ jobs:
             -DSDLIMAGE_STRICT=ON `
             -DSDLIMAGE_BACKEND_STB=OFF `
             -DSDLIMAGE_BACKEND_WIC=OFF `
+            -DSDLIMAGE_PNG_LIBPNG=ON `
+            -DSDLIMAGE_AVIF=ON `
+            -DSDLIMAGE_JPG=ON `
             -DSDLIMAGE_JXL=ON `
+            -DSDLIMAGE_PNG=ON `
+            -DSDLIMAGE_SVG=ON `
+            -DSDLIMAGE_TIF=ON `
+            -DSDLIMAGE_WEBP=ON `
             -DSDLIMAGE_SAMPLES=OFF `
             -DSDLIMAGE_TESTS=OFF
 
@@ -694,7 +762,64 @@ jobs:
           Compress-Archive -Path "runtimes" -DestinationPath "$env:ARTIFACTS_DIR\runtimes.zip" -Force
 
       # --------------------------------------------------------------
-      # Step 4: Gather release information
+      # Step 4: Fetch license file and SPDX id via GitHub API
+      # --------------------------------------------------------------
+      - name: Fetch license metadata via GitHub API
+        id: license
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          try {
+            $licenseJson = gh api repos/$repo/license | ConvertFrom-Json
+          } catch {
+            Write-Warning "No license information available for this repo."
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "license_file="
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "spdx="
+            exit 0
+          }
+
+          New-Item -ItemType Directory -Force -Path "$env:ARTIFACTS_DIR" | Out-Null
+
+          $licenseFileName = $licenseJson.name
+          if (-not $licenseFileName -or [string]::IsNullOrWhiteSpace($licenseFileName)) {
+            $licenseFileName = "LICENSE"
+            Write-Warning "License JSON did not contain a valid 'name'. Falling back to $licenseFileName"
+          }
+
+          if ($licenseJson.download_url -and -not [string]::IsNullOrWhiteSpace($licenseJson.download_url)) {
+            Write-Host "Downloading license from $($licenseJson.download_url)"
+            try {
+              Invoke-WebRequest -Uri $licenseJson.download_url -OutFile "$env:ARTIFACTS_DIR\$licenseFileName"
+            } catch {
+              Write-Warning "Failed to download license file from $($licenseJson.download_url)"
+            }
+            if (Test-Path "$env:ARTIFACTS_DIR\$licenseFileName") {
+              Write-Host "License file written as $licenseFileName"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "license_file=$licenseFileName"
+            } else {
+              Write-Warning "LICENSE file was not created!"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "license_file="
+            }
+          } else {
+            Write-Warning "No download_url in license response."
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "license_file="
+          }
+
+          if ($licenseJson.license -and $licenseJson.license.spdx_id -and $licenseJson.license.spdx_id -ne "NOASSERTION") {
+            $spdx = $licenseJson.license.spdx_id
+            $spdxClean = $spdx.Trim()
+            Write-Host "SPDX id: $spdxClean"
+            $spdxClean | Out-File -FilePath "$env:ARTIFACTS_DIR\LICENSE.spdx" -Encoding ascii -NoNewline
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "spdx=$spdxClean"
+          } else {
+            Write-Host "No valid SPDX id found."
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "spdx="
+          }
+
+      # --------------------------------------------------------------
+      # Step 5: Gather release information
       # --------------------------------------------------------------
       - name: Gather release information
         id: gather
@@ -721,7 +846,7 @@ jobs:
           if ($ridlist -eq "None") { exit 1 }
 
       # --------------------------------------------------------------
-      # Step 5: Create or update the GitHub release
+      # Step 6: Create or update the GitHub release
       # --------------------------------------------------------------
       - name: Create or update release
         uses: softprops/action-gh-release@v2
@@ -732,5 +857,8 @@ jobs:
             Based on: ${{ steps.gather.outputs.basedon }}
             SDL used for build: ${{ steps.gather.outputs.sdltag }} (required >= ${{ steps.gather.outputs.sdlreq }})
             Included runtimes: ${{ steps.gather.outputs.ridlist }}
+            ${{ steps.license.outputs.spdx && format('License: {0}', steps.license.outputs.spdx) || '' }}
           files: |
             ${{ env.ARTIFACTS_DIR }}/runtimes.zip
+            ${{ env.ARTIFACTS_DIR }}/${{ steps.license.outputs.license_file }}
+            ${{ env.ARTIFACTS_DIR }}/LICENSE.spdx
