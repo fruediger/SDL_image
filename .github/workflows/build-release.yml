@@ -462,19 +462,19 @@ jobs:
             -DSDLIMAGE_TESTS=OFF
       
       # Temporary debug step
-      - name: Show generated aom_dsp_rtcd.h
+      - name: Show generated aom_config.h
         if: matrix.rid == 'linux-arm'
         shell: bash
         run: |
           set -euo pipefail
-          FILE="build/external/aom-build/config/aom_dsp_rtcd.h"
+          FILE="build/external/aom-build/config/aom_config.h"
           if [ -f "$FILE" ]; then
             echo "----- BEGIN $FILE -----"
             cat "$FILE"
             echo "----- END $FILE -----"
           else
             echo "File not found: $FILE"
-            find build/external -name aom_dsp_rtcd.h -print || true
+            find build/external -name aom_config.h -print || true
           fi
 
       # --------------------------------------------------------------
