@@ -232,8 +232,6 @@ jobs:
 
           # ----------------------------------------------------------
           # ARM32 (armhf) cross-build
-          # -DAOM_TARGET_CPU=armv7 is necessary to ensure that the aom build rightly enables NEON throughout the configuration step and doesn't break because of missing function prototypes
-          # -DCONFIG_RUNTIME_CPU_DETECT=0 is necessary to avoid runtime CPU detection while aom configuration that would override our hardcoded AOM_TARGET_CPU
           # ----------------------------------------------------------
           - rid: linux-arm
             cc: arm-linux-gnueabihf-gcc-14
@@ -258,7 +256,7 @@ jobs:
               deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
               EOF
               sudo apt-get update
-            cmake_args: "-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm -DCMAKE_C_FLAGS=-marm -DCMAKE_CXX_FLAGS=-marm -DAOM_TARGET_CPU=armv7 -DCONFIG_RUNTIME_CPU_DETECT=0"
+            cmake_args: "-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm -DCMAKE_C_FLAGS=-marm -DCMAKE_CXX_FLAGS=-marm"
 
     env:
       BUILD_TYPE: Release
@@ -278,7 +276,36 @@ jobs:
           submodules: recursive
 
       # --------------------------------------------------------------
-      # Step 2: Install specific CMake version
+      # Step 2: Patch vendored AOM target cpu mapping for ARM32
+      # Only patch if upstream still maps SDL_CPU_ARM32 -> "arm".
+      # --------------------------------------------------------------
+      - name: Patch SDL_image vendored AOM ARM32 target mapping
+        if: matrix.rid == 'linux-arm'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="CMakeLists.txt"
+          PATTERN='set(AOM_TARGET_CPU "arm")'
+          REPLACEMENT='set(AOM_TARGET_CPU "armv7")'
+
+          count=$(grep -Fxc "$PATTERN" "$FILE" || true)
+
+          if [ "$count" -eq 0 ]; then
+            echo "No patch needed: pattern not found."
+          elif [ "$count" -eq 1 ]; then
+            echo "Patching vendored AOM target cpu mapping: arm -> armv7"
+            sed -i 's/set(AOM_TARGET_CPU "arm")/set(AOM_TARGET_CPU "armv7")/' "$FILE"
+          else
+            echo "Refusing to patch: pattern found $count times, expected exactly once."
+            exit 1
+          fi
+
+          echo "Relevant AOM_TARGET_CPU lines after patch attempt:"
+          grep -n 'AOM_TARGET_CPU' "$FILE" || true
+
+      # --------------------------------------------------------------
+      # Step 3: Install specific CMake version
       # --------------------------------------------------------------
       - name: Install CMake 3.30.0
         uses: jwlawson/actions-setup-cmake@v1
@@ -286,21 +313,21 @@ jobs:
           cmake-version: '3.30.0'
 
       # --------------------------------------------------------------
-      # Step 3: Setup architecture
+      # Step 4: Setup architecture
       # --------------------------------------------------------------
       - name: Setup architecture
         run: ${{ matrix.arch_setup }}
         shell: bash
 
       # --------------------------------------------------------------
-      # Step 4: Hold critical packages to avoid removal during multi-arch installs
+      # Step 5: Hold critical packages to avoid removal during multi-arch installs
       # --------------------------------------------------------------
       - name: Hold critical packages to avoid removal
         run: |
           sudo apt-mark hold grub-common grub-efi-amd64-bin python3 python3-apt shim-signed
 
       # --------------------------------------------------------------
-      # Step 5: Install build dependencies
+      # Step 6: Install build dependencies
       # --------------------------------------------------------------
       - name: Install build dependencies
         shell: bash
@@ -368,7 +395,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------
-      # Step 6: Ensure external/ sources exist
+      # Step 7: Ensure external/ sources exist
       # --------------------------------------------------------------
       - name: Ensure external sources exist
         shell: bash
@@ -383,7 +410,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------
-      # Step 7: Checkout SDL source
+      # Step 8: Checkout SDL source
       # --------------------------------------------------------------
       - name: Checkout SDL source
         shell: bash
@@ -415,7 +442,7 @@ jobs:
           git checkout "$SDL_UPSTREAM_COMMIT"
 
       # --------------------------------------------------------------
-      # Step 8: Build & install SDL (shared)
+      # Step 9: Build & install SDL (shared)
       # --------------------------------------------------------------
       - name: Build & install SDL (shared)
         shell: bash
@@ -434,7 +461,7 @@ jobs:
           cmake --install _deps/SDL-build
 
       # --------------------------------------------------------------
-      # Step 9: Configure SDL_image
+      # Step 10: Configure SDL_image
       # --------------------------------------------------------------
       - name: Configure SDL_image
         shell: bash
@@ -464,14 +491,14 @@ jobs:
             -DSDLIMAGE_TESTS=OFF
 
       # --------------------------------------------------------------
-      # Step 10: Build SDL_image
+      # Step 11: Build SDL_image
       # --------------------------------------------------------------
       - name: Build SDL_image
         shell: bash
         run: cmake --build build --config $BUILD_TYPE
 
       # --------------------------------------------------------------
-      # Step 11: Copy built library to package dir and mark success
+      # Step 12: Copy built library to package dir and mark success
       # --------------------------------------------------------------
       - name: Copy library and mark success
         shell: bash
@@ -493,7 +520,7 @@ jobs:
           echo "${{ matrix.rid }}" > "$SUCCESS_DIR/${{ matrix.rid }}.txt"
 
       # --------------------------------------------------------------
-      # Step 12: Upload built binary as artifact
+      # Step 13: Upload built binary as artifact
       # --------------------------------------------------------------
       - name: Upload artifact (binary)
         if: success() || failure()
@@ -504,7 +531,7 @@ jobs:
           if-no-files-found: ignore
 
       # --------------------------------------------------------------
-      # Step 13: Upload success marker as artifact
+      # Step 14: Upload success marker as artifact
       # --------------------------------------------------------------
       - name: Upload artifact (success marker)
         if: success() || failure()
