@@ -278,6 +278,9 @@ jobs:
       # --------------------------------------------------------------
       # Step 2: Patch vendored AOM target cpu mapping for ARM32
       # Only patch if upstream still maps SDL_CPU_ARM32 -> "arm".
+      # THIS IS ABSOLUTELY NEEDED! Otherwise the SDL_image build would overwrite AOM_TARGET_CPU to "arm", regardless what we'd set it to before,
+      # and that, in turn, breaks the AOM build,
+      # because some function prototypes in some auto-generated headers for NEON variants are only emitted if AOM_TARGET_CPU is set to "armv7" or "armv8" but not "arm".
       # --------------------------------------------------------------
       - name: Patch SDL_image vendored AOM ARM32 target mapping
         if: matrix.rid == 'linux-arm'
