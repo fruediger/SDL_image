@@ -1,0 +1,591 @@
+name: Pack NuGet test package
+
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package (optional). If empty, uses the latest release."
+        required: false
+      publish:
+        description: "Push the generated package to nuget.org"
+        type: boolean
+        default: false
+
+  repository_dispatch:
+    types: [pack-nuget-test-package]
+
+jobs:
+  pack_nuget_test_package:
+    name: Pack NuGet test package
+    runs-on: windows-latest
+
+    env:
+      ARTIFACTS_DIR: ${{ github.workspace }}\artifacts
+      STAGING_DIR: ${{ github.workspace }}\staging
+      OUTPUT_DIR: ${{ github.workspace }}\output
+      TEMPLATE_CSPROJ: ${{ github.workspace }}\.github\packaging\Sdl3Sharp.SDL_image.Test.csproj
+      DEFAULT_PACKAGE_ID: Sdl3Sharp.SDL_image.Test
+
+    steps:
+      # --------------------------------------------------------------
+      # 1. Checkout repository
+      # --------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # --------------------------------------------------------------
+      # 2. Determine target release
+      # --------------------------------------------------------------
+      - name: Determine target release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $inputTag    = "${{ github.event.inputs.tag }}"
+          $dispatchTag = "${{ github.event.client_payload.tag }}"
+          $repo        = "${{ github.repository }}"
+
+          if (-not [string]::IsNullOrWhiteSpace($inputTag)) {
+            $tag = $inputTag
+          } elseif (-not [string]::IsNullOrWhiteSpace($dispatchTag)) {
+            $tag = $dispatchTag
+          } else {
+            $latestRelease = gh api "repos/$repo/releases/latest" | ConvertFrom-Json
+            $tag = $latestRelease.tag_name
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            Write-Error "Failed to resolve release tag."
+            exit 1
+          }
+
+          $release = gh api "repos/$repo/releases/tags/$tag" | ConvertFrom-Json
+          $version = $release.tag_name
+          if ($version.StartsWith("v")) {
+            $version = $version.Substring(1)
+          }
+
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            Write-Error "Resolved release version is empty."
+            exit 1
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Resolved release version '$version' is not in the expected form 'x.y.z'."
+            exit 1
+          }
+
+          Write-Host "Resolved tag: $($release.tag_name)"
+          Write-Host "Resolved release version: $version"
+          Write-Host "Release id: $($release.id)"
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$($release.tag_name)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "release_version=$version"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "release_id=$($release.id)"
+
+      # --------------------------------------------------------------
+      # 3. Create working directories
+      # --------------------------------------------------------------
+      - name: Create working directories
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ARTIFACTS_DIR" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:STAGING_DIR" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:OUTPUT_DIR" | Out-Null
+
+      # --------------------------------------------------------------
+      # 4. Download release assets
+      # --------------------------------------------------------------
+      - name: Download release assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $repo      = "${{ github.repository }}"
+          $releaseId = "${{ steps.release.outputs.release_id }}"
+
+          $assets = gh api "repos/$repo/releases/$releaseId/assets" | ConvertFrom-Json
+          if (-not $assets) {
+            Write-Warning "No release assets found. Nothing to do."
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "has_runtimes_zip=false"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "license_file="
+            exit 0
+          }
+
+          $runtimesAsset = $assets | Where-Object { $_.name -eq "runtimes.zip" } | Select-Object -First 1
+          if (-not $runtimesAsset) {
+            Write-Warning "Release asset 'runtimes.zip' not found. Nothing to do."
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "has_runtimes_zip=false"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "license_file="
+            exit 0
+          }
+
+          Write-Host "Downloading runtimes asset: $($runtimesAsset.name)"
+          gh api `
+            -H "Accept: application/octet-stream" `
+            "repos/$repo/releases/assets/$($runtimesAsset.id)" > "$env:ARTIFACTS_DIR\runtimes.zip"
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "has_runtimes_zip=true"
+
+          $licenseSpdxAsset = $assets | Where-Object { $_.name -eq "LICENSE.spdx" } | Select-Object -First 1
+          if ($licenseSpdxAsset) {
+            Write-Host "Downloading SPDX asset: $($licenseSpdxAsset.name)"
+            gh api `
+              -H "Accept: application/octet-stream" `
+              "repos/$repo/releases/assets/$($licenseSpdxAsset.id)" > "$env:ARTIFACTS_DIR\LICENSE.spdx"
+          }
+
+          $licenseAsset = $assets |
+            Where-Object {
+              $_.name -ne "runtimes.zip" -and
+              $_.name -ne "LICENSE.spdx" -and
+              [string]::Equals(
+                [System.IO.Path]::GetFileNameWithoutExtension($_.name),
+                "license",
+                [System.StringComparison]::OrdinalIgnoreCase
+              )
+            } |
+            Select-Object -First 1
+
+          if ($licenseAsset) {
+            Write-Host "Downloading license asset: $($licenseAsset.name)"
+            gh api `
+              -H "Accept: application/octet-stream" `
+              "repos/$repo/releases/assets/$($licenseAsset.id)" > "$env:ARTIFACTS_DIR\$($licenseAsset.name)"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "license_file=$($licenseAsset.name)"
+          } else {
+            Write-Host "No license file asset found."
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "license_file="
+          }
+
+      # --------------------------------------------------------------
+      # 5. Extract runtimes archive
+      # --------------------------------------------------------------
+      - name: Extract runtimes archive
+        if: steps.assets.outputs.has_runtimes_zip == 'true'
+        shell: pwsh
+        run: |
+          Expand-Archive -Path "$env:ARTIFACTS_DIR\runtimes.zip" -DestinationPath "$env:STAGING_DIR" -Force
+
+          if (-not (Test-Path "$env:STAGING_DIR\runtimes")) {
+            Write-Warning "Extracted archive does not contain a top-level 'runtimes' directory. Nothing to do."
+            exit 0
+          }
+
+      # --------------------------------------------------------------
+      # 6. Detect available RIDs
+      # --------------------------------------------------------------
+      - name: Detect available RIDs
+        id: rids
+        if: steps.assets.outputs.has_runtimes_zip == 'true'
+        shell: pwsh
+        run: |
+          $runtimesRoot = "$env:STAGING_DIR\runtimes"
+
+          if (-not (Test-Path $runtimesRoot)) {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "count=0"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "rid_list="
+            Write-Host "No runtimes directory present."
+            exit 0
+          }
+
+          $rids = Get-ChildItem -Path $runtimesRoot -Directory |
+            Where-Object { Test-Path (Join-Path $_.FullName "native") } |
+            Where-Object { (Get-ChildItem -Path (Join-Path $_.FullName "native") -File | Measure-Object).Count -gt 0 } |
+            Select-Object -ExpandProperty Name
+
+          if (-not $rids) {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "count=0"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "rid_list="
+            Write-Host "No RIDs with native assets found."
+            exit 0
+          }
+
+          $ridList = ($rids | Sort-Object) -join ","
+          $count = ($rids | Measure-Object).Count
+
+          Write-Host "Detected RIDs: $ridList"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "count=$count"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "rid_list=$ridList"
+
+      # --------------------------------------------------------------
+      # 7. Resolve license metadata for packing
+      # --------------------------------------------------------------
+      - name: Resolve license metadata for packing
+        id: license
+        if: steps.rids.outputs.count != '0'
+        shell: pwsh
+        run: |
+          $licenseFile = "${{ steps.assets.outputs.license_file }}"
+          if ([string]::IsNullOrWhiteSpace($licenseFile)) {
+            $licenseFile = ""
+          }
+
+          $spdx = ""
+          $spdxPath = "$env:ARTIFACTS_DIR\LICENSE.spdx"
+          if (Test-Path $spdxPath) {
+            $spdx = (Get-Content $spdxPath -Raw).Trim()
+          }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "license_asset_file=$licenseFile"
+
+          if (-not [string]::IsNullOrWhiteSpace($spdx) -and $spdx -ne "NOASSERTION") {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "package_license_expression=$spdx"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "package_license_file="
+          } elseif (-not [string]::IsNullOrWhiteSpace($licenseFile) -and (Test-Path "$env:ARTIFACTS_DIR\$licenseFile")) {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "package_license_expression="
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "package_license_file=$licenseFile"
+          } else {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "package_license_expression="
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "package_license_file="
+          }
+
+      # --------------------------------------------------------------
+      # 8. Resolve package id from template
+      # --------------------------------------------------------------
+      - name: Resolve package id from template
+        id: package
+        if: steps.rids.outputs.count != '0'
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Xml.Linq
+
+          $xProject = [System.Xml.Linq.XName]::Get("Project")
+          $xPropertyGroup = [System.Xml.Linq.XName]::Get("PropertyGroup")
+          $xPackageId = [System.Xml.Linq.XName]::Get("PackageId")
+
+          if (-not (Test-Path "$env:TEMPLATE_CSPROJ")) {
+            Write-Error "Template project file not found: $env:TEMPLATE_CSPROJ"
+            exit 1
+          }
+
+          $doc = [System.Xml.Linq.XDocument]::Load("$env:TEMPLATE_CSPROJ")
+          $project = $doc.Element($xProject)
+
+          if (-not $project) {
+            Write-Error "Template project file does not contain a root <Project> element."
+            exit 1
+          }
+
+          $packageId = $null
+          foreach ($pg in $project.Elements($xPropertyGroup)) {
+            $prop = $pg.Element($xPackageId)
+            if ($prop -and -not [string]::IsNullOrWhiteSpace($prop.Value)) {
+              $packageId = $prop.Value.Trim()
+              break
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($packageId)) {
+            $packageId = "$env:DEFAULT_PACKAGE_ID"
+          }
+
+          Write-Host "Resolved package id: $packageId"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "id=$packageId"
+
+      # --------------------------------------------------------------
+      # 9. Resolve package version from nuget.org
+      # --------------------------------------------------------------
+      - name: Resolve package version from nuget.org
+        id: version
+        if: steps.rids.outputs.count != '0'
+        shell: pwsh
+        run: |
+          $packageId = "${{ steps.package.outputs.id }}"
+          $baseVersion = "${{ steps.release.outputs.release_version }}"
+
+          if ([string]::IsNullOrWhiteSpace($packageId)) {
+            Write-Error "Resolved package id is empty."
+            exit 1
+          }
+
+          if ([string]::IsNullOrWhiteSpace($baseVersion)) {
+            Write-Error "Resolved base release version is empty."
+            exit 1
+          }
+
+          $packageIdLower = $packageId.ToLowerInvariant()
+          $indexUrl = "https://api.nuget.org/v3-flatcontainer/$packageIdLower/index.json"
+
+          $existingVersions = @()
+          try {
+            $response = Invoke-RestMethod -Method Get -Uri $indexUrl
+            if ($response -and $response.versions) {
+              $existingVersions = @($response.versions)
+            }
+          }
+          catch {
+            Write-Host "Package version index not found or not readable yet for '$packageId'. Assuming no existing versions."
+          }
+
+          $existingVersionSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($v in $existingVersions) {
+            [void] $existingVersionSet.Add([string] $v)
+          }
+
+          $i = 0
+          while ($true) {
+            $candidate = "$baseVersion-r.$i"
+            if (-not $existingVersionSet.Contains($candidate)) {
+              break
+            }
+            $i++
+          }
+
+          Write-Host "Resolved package version: $candidate"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "value=$candidate"
+
+      # --------------------------------------------------------------
+      # 10. Generate temporary pack project from template (XML-based)
+      # --------------------------------------------------------------
+      - name: Generate temporary pack project from template
+        if: steps.rids.outputs.count != '0'
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Xml.Linq
+
+          $xProject = [System.Xml.Linq.XName]::Get("Project")
+          $xPropertyGroup = [System.Xml.Linq.XName]::Get("PropertyGroup")
+          $xItemGroup = [System.Xml.Linq.XName]::Get("ItemGroup")
+          $xVersion = [System.Xml.Linq.XName]::Get("Version")
+          $xPackageLicenseExpression = [System.Xml.Linq.XName]::Get("PackageLicenseExpression")
+          $xPackageLicenseFile = [System.Xml.Linq.XName]::Get("PackageLicenseFile")
+          $xNone = [System.Xml.Linq.XName]::Get("None")
+          $xInclude = [System.Xml.Linq.XName]::Get("Include")
+          $xPack = [System.Xml.Linq.XName]::Get("Pack")
+          $xPackagePath = [System.Xml.Linq.XName]::Get("PackagePath")
+
+          if (-not (Test-Path "$env:TEMPLATE_CSPROJ")) {
+            Write-Error "Template project file not found: $env:TEMPLATE_CSPROJ"
+            exit 1
+          }
+
+          $outputProjectPath = "$env:STAGING_DIR\pack.csproj"
+          Copy-Item "$env:TEMPLATE_CSPROJ" $outputProjectPath -Force
+
+          $doc = [System.Xml.Linq.XDocument]::Load($outputProjectPath)
+          $project = $doc.Element($xProject)
+
+          if (-not $project) {
+            Write-Error "Template project file does not contain a root <Project> element."
+            exit 1
+          }
+
+          $propertyGroups = @($project.Elements($xPropertyGroup))
+          $primaryPropertyGroup = if ($propertyGroups.Count -gt 0) {
+            $propertyGroups[0]
+          } else {
+            $newGroup = [System.Xml.Linq.XElement]::new($xPropertyGroup)
+            $project.AddFirst($newGroup)
+            $newGroup
+          }
+
+          function Get-ProjectProperty([System.Xml.Linq.XElement] $projectElement, [System.Xml.Linq.XName] $name) {
+            foreach ($pg in $projectElement.Elements($xPropertyGroup)) {
+              $prop = $pg.Element($name)
+              if ($prop) { return $prop }
+            }
+            return $null
+          }
+
+          function Ensure-ProjectPropertyIfMissing([System.Xml.Linq.XElement] $projectElement, [System.Xml.Linq.XElement] $targetPropertyGroup, [System.Xml.Linq.XName] $name, [string] $value) {
+            if ([string]::IsNullOrWhiteSpace($value)) { return }
+            $existing = Get-ProjectProperty $projectElement $name
+            if (-not $existing) {
+              $targetPropertyGroup.Add([System.Xml.Linq.XElement]::new($name, $value))
+            }
+          }
+
+          $resolvedVersion = "${{ steps.version.outputs.value }}"
+          $packageLicenseExpression = "${{ steps.license.outputs.package_license_expression }}"
+          $packageLicenseFile = "${{ steps.license.outputs.package_license_file }}"
+          $licenseAssetFile = "${{ steps.license.outputs.license_asset_file }}"
+
+          Ensure-ProjectPropertyIfMissing $project $primaryPropertyGroup $xVersion $resolvedVersion
+          Ensure-ProjectPropertyIfMissing $project $primaryPropertyGroup $xPackageLicenseExpression $packageLicenseExpression
+          Ensure-ProjectPropertyIfMissing $project $primaryPropertyGroup $xPackageLicenseFile $packageLicenseFile
+
+          $runtimesInclude = "$env:STAGING_DIR\runtimes\**\*"
+          $hasRuntimesItem = $false
+
+          foreach ($ig in $project.Elements($xItemGroup)) {
+            foreach ($none in $ig.Elements($xNone)) {
+              $includeAttr = $none.Attribute($xInclude)
+              $packAttr = $none.Attribute($xPack)
+              $packagePathAttr = $none.Attribute($xPackagePath)
+
+              if ($includeAttr -and
+                  $packAttr -and $packAttr.Value -eq "true" -and
+                  $packagePathAttr -and $packagePathAttr.Value -eq "runtimes\" -and
+                  $includeAttr.Value -eq $runtimesInclude) {
+                $hasRuntimesItem = $true
+                break
+              }
+            }
+            if ($hasRuntimesItem) { break }
+          }
+
+          $itemGroup = $project.Elements($xItemGroup) | Select-Object -First 1
+          if (-not $itemGroup) {
+            $itemGroup = [System.Xml.Linq.XElement]::new($xItemGroup)
+            $project.Add($itemGroup)
+          }
+
+          if (-not $hasRuntimesItem) {
+            $noneElement = [System.Xml.Linq.XElement]::new($xNone)
+            $noneElement.SetAttributeValue($xInclude, $runtimesInclude)
+            $noneElement.SetAttributeValue($xPack, "true")
+            $noneElement.SetAttributeValue($xPackagePath, "runtimes\")
+            $itemGroup.Add($noneElement)
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($licenseAssetFile)) {
+            $licenseInclude = "$env:ARTIFACTS_DIR\$licenseAssetFile"
+            $hasLicenseItem = $false
+
+            foreach ($ig in $project.Elements($xItemGroup)) {
+              foreach ($none in $ig.Elements($xNone)) {
+                $includeAttr = $none.Attribute($xInclude)
+                $packAttr = $none.Attribute($xPack)
+                $packagePathAttr = $none.Attribute($xPackagePath)
+
+                if ($includeAttr -and
+                    $packAttr -and $packAttr.Value -eq "true" -and
+                    $packagePathAttr -and $packagePathAttr.Value -eq "" -and
+                    $includeAttr.Value -eq $licenseInclude) {
+                  $hasLicenseItem = $true
+                  break
+                }
+              }
+              if ($hasLicenseItem) { break }
+            }
+
+            if (-not $hasLicenseItem) {
+              $licenseNoneElement = [System.Xml.Linq.XElement]::new($xNone)
+              $licenseNoneElement.SetAttributeValue($xInclude, $licenseInclude)
+              $licenseNoneElement.SetAttributeValue($xPack, "true")
+              $licenseNoneElement.SetAttributeValue($xPackagePath, "")
+              $itemGroup.Add($licenseNoneElement)
+            }
+          }
+
+          $settings = [System.Xml.XmlWriterSettings]::new()
+          $settings.Indent = $true
+          $settings.OmitXmlDeclaration = $true
+          $settings.NewLineChars = "`r`n"
+          $settings.NewLineHandling = [System.Xml.NewLineHandling]::Replace
+
+          $writer = [System.Xml.XmlWriter]::Create($outputProjectPath, $settings)
+          try {
+            $doc.Save($writer)
+          }
+          finally {
+            $writer.Dispose()
+          }
+
+      # --------------------------------------------------------------
+      # 11. Show generated pack project
+      # --------------------------------------------------------------
+      - name: Show generated pack project
+        if: steps.rids.outputs.count != '0'
+        shell: pwsh
+        run: |
+          $projectPath = "$env:STAGING_DIR\pack.csproj"
+          if (-not (Test-Path $projectPath)) {
+            Write-Error "Generated pack project not found: $projectPath"
+            exit 1
+          }
+
+          Write-Host "Generated pack project:"
+          Write-Host "------------------------------------------------------------"
+          Write-Host (Get-Content -Path $projectPath -Raw)
+          Write-Host "------------------------------------------------------------"
+
+      # --------------------------------------------------------------
+      # 12. Pack NuGet package
+      # --------------------------------------------------------------
+      - name: Pack NuGet package
+        if: steps.rids.outputs.count != '0'
+        shell: pwsh
+        run: |
+          dotnet pack "$env:STAGING_DIR\pack.csproj" `
+            -c Release `
+            -o "$env:OUTPUT_DIR" `
+            --nologo
+
+      # --------------------------------------------------------------
+      # 13. Show package contents
+      # --------------------------------------------------------------
+      - name: Show package contents
+        if: steps.rids.outputs.count != '0'
+        shell: pwsh
+        run: |
+          $nupkg = Get-ChildItem -Path "$env:OUTPUT_DIR" -Filter "*.nupkg" | Select-Object -First 1
+          if (-not $nupkg) {
+            Write-Error "No .nupkg file was produced."
+            exit 1
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg.FullName)
+          try {
+            $zip.Entries | ForEach-Object { $_.FullName }
+          }
+          finally {
+            $zip.Dispose()
+          }
+
+      # --------------------------------------------------------------
+      # 14. Upload package artifact
+      # --------------------------------------------------------------
+      - name: Upload package artifact
+        if: steps.rids.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-test-package-${{ steps.version.outputs.value }}
+          path: output/*.nupkg
+          if-no-files-found: error
+
+      # --------------------------------------------------------------
+      # 15. NuGet login (OIDC → temp API key)
+      # --------------------------------------------------------------
+      - name: NuGet login (OIDC → temp API key)
+        id: login
+        if: steps.rids.outputs.count != '0' && (github.event_name == 'repository_dispatch' || github.event.inputs.publish == 'true')
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER_NATIVE_TEST }}
+
+      # --------------------------------------------------------------
+      # 16. Push package to nuget.org
+      # --------------------------------------------------------------
+      - name: Push package to nuget.org
+        if: steps.rids.outputs.count != '0' && (github.event_name == 'repository_dispatch' || github.event.inputs.publish == 'true')
+        shell: pwsh
+        run: |
+          $nupkg = Get-ChildItem -Path "$env:OUTPUT_DIR" -Filter "*.nupkg" | Select-Object -First 1
+          if (-not $nupkg) {
+            Write-Error "No .nupkg file found to publish."
+            exit 1
+          }
+
+          dotnet nuget push $nupkg.FullName `
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" `
+            --source "https://api.nuget.org/v3/index.json"
+
+      # --------------------------------------------------------------
+      # 17. Nothing to package
+      # --------------------------------------------------------------
+      - name: Nothing to package
+        if: steps.assets.outputs.has_runtimes_zip != 'true' || steps.rids.outputs.count == '0'
+        shell: pwsh
+        run: |
+          Write-Host "No native runtime assets were found to package. Skipping pack and publish."
