@@ -286,16 +286,16 @@ jobs:
           set -euo pipefail
 
           FILE="CMakeLists.txt"
-          PATTERN='set(AOM_TARGET_CPU "arm")'
-          REPLACEMENT='set(AOM_TARGET_CPU "armv7")'
+          SEARCH='set(AOM_TARGET_CPU "arm")'
+          REPLACE='set(AOM_TARGET_CPU "armv7")'
 
-          count=$(grep -Fxc "$PATTERN" "$FILE" || true)
+          count=$(grep -F "$SEARCH" "$FILE" | wc -l | tr -d '[:space:]')
 
-          if [ "$count" -eq 0 ]; then
+          if [ "$count" = "0" ]; then
             echo "No patch needed: pattern not found."
-          elif [ "$count" -eq 1 ]; then
+          elif [ "$count" = "1" ]; then
             echo "Patching vendored AOM target cpu mapping: arm -> armv7"
-            sed -i 's/set(AOM_TARGET_CPU "arm")/set(AOM_TARGET_CPU "armv7")/' "$FILE"
+            sed -i "s|$SEARCH|$REPLACE|" "$FILE"
           else
             echo "Refusing to patch: pattern found $count times, expected exactly once."
             exit 1
