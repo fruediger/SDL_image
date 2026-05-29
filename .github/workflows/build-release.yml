@@ -190,6 +190,7 @@ jobs:
           # ----------------------------------------------------------
           # 32-bit x86 build — runs on amd64 host with -m32
           # Needs multilib toolchain and 32-bit libs to link successfully.
+          # We need to force ELF-32 output for NASM (for whatever reason, it doesn't pick this up by itself) by setting CMAKE_ASM_NASM_OBJECT_FORMAT to elf32.
           # ----------------------------------------------------------
           - rid: linux-x86
             cc: gcc-14
