@@ -233,6 +233,7 @@ jobs:
           # ----------------------------------------------------------
           # ARM32 (armhf) cross-build
           # -DAOM_TARGET_CPU=armv7 is necessary to ensure that the aom build rightly enables NEON throughout the configuration step and doesn't break because of missing function prototypes
+          # -DCONFIG_RUNTIME_CPU_DETECT=0 is necessary to avoid runtime CPU detection while aom configuration that would override our hardcoded AOM_TARGET_CPU
           # ----------------------------------------------------------
           - rid: linux-arm
             cc: arm-linux-gnueabihf-gcc-14
@@ -257,7 +258,7 @@ jobs:
               deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
               EOF
               sudo apt-get update
-            cmake_args: "-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm -DCMAKE_C_FLAGS=-marm -DCMAKE_CXX_FLAGS=-marm -DAOM_TARGET_CPU=armv7"
+            cmake_args: "-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm -DCMAKE_C_FLAGS=-marm -DCMAKE_CXX_FLAGS=-marm -DAOM_TARGET_CPU=armv7 -DCONFIG_RUNTIME_CPU_DETECT=0"
 
     env:
       BUILD_TYPE: Release
